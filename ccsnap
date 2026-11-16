@@ -1,1178 +1,996 @@
 #!/usr/bin/env python3
-"""ccsnap - snapshot and restore Claude Code sessions living in tmux.
+"""ccsnap - snapshot tmux sessions running Claude Code, and restore them after a reboot.
 
-  ccsnap                  save a snapshot now (same as `ccsnap save`)
-  ccsnap list             list saved snapshots
-  ccsnap show [ID]        show what a snapshot holds
-  ccsnap restore [ID]     rebuild the tmux sessions and resume Claude in each pane
-  ccsnap auto on|off      snapshot automatically every few minutes (launchd)
+  ccsnap save              take a snapshot now (autosave does this every 2 minutes)
+  ccsnap list              list snapshots, newest first
+  ccsnap show [N]          show what a snapshot would restore
+  ccsnap restore [N]       recreate missing tmux sessions and resume their Claude sessions
+  ccsnap auto on|off       turn autosave on or off (systemd timer on Linux, launchd on macOS)
 
-A snapshot records every tmux session/window/pane (layout, directory) and, for
-each pane running Claude Code, the conversation's session id, name, model and
-permission mode. Restore recreates the tmux layout and types the matching
-`claude --resume <id>` into each pane. It only ever adds: tmux sessions that
-already exist and conversations that are already running are left alone.
-
-Snapshots live in ~/.ccsnap/snapshots (override with $CCSNAP_HOME).
+Snapshots are small JSON files in ~/.local/state/ccsnap/snapshots (Linux) or
+~/.ccsnap/snapshots (macOS); $CCSNAP_HOME overrides. Standard library only.
 """
 
 import argparse
 import calendar
-import glob
-import hashlib
 import json
 import os
 import plistlib
 import shlex
 import shutil
-import socket
 import subprocess
 import sys
 import time
+from datetime import datetime
+from pathlib import Path
 
-SNAPSHOT_FORMAT = 1
-HOME = os.path.expanduser("~")
-STATE_DIR = os.environ.get("CCSNAP_HOME") or os.path.join(HOME, ".ccsnap")
-SNAP_DIR = os.path.join(STATE_DIR, "snapshots")
-CLAUDE_DIR = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(HOME, ".claude")
-# `tmux -L <name>`: lets ccsnap be pointed at a scratch tmux server for testing.
-TMUX_SOCKET = os.environ.get("CCSNAP_TMUX_SOCKET")
+__version__ = "0.2.0"
 
-SEP = "<|ccsnap|>"
-SHELLS = {"bash", "zsh", "fish", "sh", "dash", "ksh", "tcsh", "csh"}
-# Permission modes worth carrying across a restart. The default mode needs no flag.
-RESTORABLE_MODES = {"acceptEdits", "auto", "dontAsk", "plan"}
+MAC = sys.platform == "darwin"
+# Linux reads /proc. Elsewhere (macOS) the same facts come from `ps`; CCSNAP_PS=1 forces
+# that path on Linux too, which is how it gets exercised without a Mac.
+USE_PROC = os.path.isdir("/proc/self") and not os.environ.get("CCSNAP_PS")
 
-# Retention: newest N, plus the last snapshot of each recent day, plus the last
-# snapshot of each recent tmux-server lifetime (the "what I lost" record).
-KEEP_RECENT = 30
-KEEP_DAYS = 14
-KEEP_EPOCHS = 8
-
+HOME = Path.home()
+CLAUDE_DIR = Path(os.environ.get("CLAUDE_CONFIG_DIR") or HOME / ".claude")
+if os.environ.get("CCSNAP_HOME"):
+    STATE_DIR = Path(os.environ["CCSNAP_HOME"])
+elif MAC:
+    STATE_DIR = HOME / ".ccsnap"
+else:
+    STATE_DIR = Path(os.environ.get("XDG_STATE_HOME") or HOME / ".local/state") / "ccsnap"
+SNAP_DIR = STATE_DIR / "snapshots"
+UNIT_DIR = Path(os.environ.get("XDG_CONFIG_HOME") or HOME / ".config") / "systemd/user"
 LAUNCHD_LABEL = "com.ccsnap.autosave"
-LAUNCHD_PLIST = os.path.join(HOME, "Library", "LaunchAgents", LAUNCHD_LABEL + ".plist")
-AUTO_LOG = os.path.join(STATE_DIR, "auto.log")
-
-PANE_FIELDS = (
-    "session_name", "session_attached",
-    "window_id", "window_index", "window_name", "window_active",
-    "window_layout", "window_width", "window_height", "automatic-rename",
-    "pane_id", "pane_index", "pane_active", "pane_tty",
-    "pane_current_command", "pane_current_path",
-)
+LAUNCHD_PLIST = HOME / "Library/LaunchAgents" / (LAUNCHD_LABEL + ".plist")
+AUTO_LOG = STATE_DIR / "auto.log"
+KEEP = 200            # snapshots kept on disk (identical states are never re-saved)
+# `tmux -L <name>`: point ccsnap at a scratch tmux server. None = the default server.
+TMUX_SOCKET = os.environ.get("CCSNAP_TMUX_SOCKET") or None
 
 
-# --------------------------------------------------------------------------- helpers
+# ---------------------------------------------------------------- tmux helpers
 
-def run(cmd, timeout=30, env=None):
-    try:
-        p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                           timeout=timeout, env=env)
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        return 1, "", str(exc)
-    return (p.returncode, p.stdout.decode("utf-8", "replace"),
-            p.stderr.decode("utf-8", "replace").strip())
-
-
-_tmux_bin = None
+_TMUX_BIN = None
 
 
 def tmux_bin():
-    global _tmux_bin
-    if _tmux_bin is None:
-        _tmux_bin = shutil.which("tmux") or next(
-            (p for p in ("/usr/local/bin/tmux", "/opt/homebrew/bin/tmux", "/usr/bin/tmux")
-             if os.path.exists(p)), "")
-    return _tmux_bin
+    """tmux from PATH, else the usual install places (launchd and systemd run with a bare PATH)."""
+    global _TMUX_BIN
+    if _TMUX_BIN is None:
+        _TMUX_BIN = shutil.which("tmux") or next(
+            (p for p in ("/opt/homebrew/bin/tmux", "/usr/local/bin/tmux", "/usr/bin/tmux")
+             if os.path.exists(p)), "tmux")
+    return _TMUX_BIN
 
 
-def tmux(*args):
-    if not tmux_bin():
-        return 127, "", "tmux not found"
-    cmd = [tmux_bin(), "-u"] + (["-L", TMUX_SOCKET] if TMUX_SOCKET else []) + list(args)
-    rc, out, err = run(cmd)
-    return rc, out.rstrip("\n"), err
-
-
-def die(msg, code=1):
-    sys.stdout.flush()
-    print("ccsnap: " + msg, file=sys.stderr)
-    sys.exit(code)
-
-
-def short(path):
-    if not path:
-        return "?"
-    return "~" + path[len(HOME):] if path == HOME or path.startswith(HOME + "/") else path
-
-
-def ago(ts):
-    d = max(0, time.time() - ts)
-    if d < 90:
-        return "just now"
-    if d < 3600 * 1.5:
-        return "%dm ago" % (d // 60)
-    if d < 86400 * 2:
-        return "%dh ago" % (d // 3600)
-    return "%dd ago" % (d // 86400)
-
-
-def when(ts):
-    return time.strftime("%a %d %b %H:%M", time.localtime(ts))
-
-
-def plural(n, word):
-    return "%d %s%s" % (n, word, "" if n == 1 else "s")
-
-
-def boot_time():
-    if sys.platform == "darwin":
-        rc, out, _ = run(["sysctl", "-n", "kern.boottime"])
-        if rc == 0 and "sec =" in out:
-            try:
-                return int(out.split("sec =")[1].split(",")[0])
-            except ValueError:
-                return None
+def tmux(*args, check=True):
+    # -u: UTF-8 output even under the C locale that autosave runs in, so session and window
+    # names with non-ASCII characters are recorded as they are.
+    cmd = [tmux_bin(), "-u"] + (["-L", TMUX_SOCKET] if TMUX_SOCKET else []) + [str(a) for a in args]
     try:
-        with open("/proc/stat") as fh:
-            for line in fh:
-                if line.startswith("btime "):
-                    return int(line.split()[1])
+        r = subprocess.run(cmd, capture_output=True, encoding="utf-8", errors="replace")
+    except OSError as e:
+        r = subprocess.CompletedProcess(cmd, 127, "", f"cannot run tmux: {e}")
+    if check and r.returncode != 0:
+        raise RuntimeError(f"`{shlex.join(cmd)}` failed: {r.stderr.strip()}")
+    return r
+
+
+def tmux_rows(args, fields):
+    """Run a tmux list command; return list of dicts, or None if no server is running."""
+    fmt = "\t".join("#{%s}" % f for f in fields)
+    r = tmux(*args, "-F", fmt, check=False)
+    if r.returncode != 0:
+        return None
+    return [dict(zip(fields, line.split("\t"))) for line in r.stdout.splitlines()]
+
+
+def current_session_names():
+    rows = tmux_rows(["list-sessions"], ["session_name"])
+    return {r["session_name"] for r in rows or []}
+
+
+# ---------------------------------------------------------------- processes + claude state
+
+_PS = {"at": 0.0, "table": {}}
+
+
+def parse_lstart(text):
+    """`ps -o lstart`, and the procStart Claude records on macOS ("Mon Nov 16 03:55:33 2026",
+    UTC), as epoch seconds. None if it is not in that form."""
+    try:
+        return calendar.timegm(time.strptime(" ".join(str(text).split()), "%a %b %d %H:%M:%S %Y"))
+    except (ValueError, TypeError):
+        return None
+
+
+def ps_table():
+    """pid -> (ppid, start epoch, command line) from `ps`, for systems without /proc.
+    ps runs in UTC so start times compare directly with Claude's procStart. The table is
+    reused for a second: one ccsnap command asks about many pids."""
+    if time.time() - _PS["at"] > 1.0:
+        try:
+            out = subprocess.run(
+                ["ps", "-A", "-ww", "-o", "pid=", "-o", "ppid=", "-o", "lstart=", "-o", "command="],
+                capture_output=True, encoding="utf-8", errors="replace",
+                env=dict(os.environ, LC_ALL="C", TZ="UTC")).stdout
+        except OSError:
+            out = ""
+        table = {}
+        for line in out.splitlines():
+            parts = line.split(None, 7)   # pid, ppid, five lstart words, the rest
+            if len(parts) < 7:
+                continue
+            try:
+                pid, ppid = int(parts[0]), int(parts[1])
+            except ValueError:
+                continue
+            table[pid] = (ppid, parse_lstart(" ".join(parts[2:7])), parts[7] if len(parts) > 7 else "")
+        _PS["at"], _PS["table"] = time.time(), table
+    return _PS["table"]
+
+
+def proc_stat(pid):
+    """(ppid, start) of a live process, or None. `start` tells a process from a later one
+    that reused its pid: the /proc starttime on Linux, epoch seconds from ps elsewhere."""
+    if not USE_PROC:
+        row = ps_table().get(int(pid))
+        return (row[0], row[1]) if row else None
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            s = f.read()
     except OSError:
-        pass
+        return None
+    rest = s[s.rfind(")") + 2:].split()
+    return int(rest[1]), rest[19]
+
+
+def proc_argv(pid):
+    """The process's command line as a list, or None. From ps it is split on spaces, so an
+    argument containing spaces comes back in pieces; /proc keeps arguments intact."""
+    if not USE_PROC:
+        row = ps_table().get(int(pid))
+        return row[2].split() if row else None
+    try:
+        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+    except OSError:
+        return None
+    return [a.decode(errors="replace") for a in raw.rstrip(b"\0").split(b"\0")]
+
+
+def children_map():
+    pids = list(ps_table()) if not USE_PROC else [int(d) for d in os.listdir("/proc") if d.isdigit()]
+    kids = {}
+    for pid in pids:
+        st = proc_stat(pid)
+        if st:
+            kids.setdefault(st[0], []).append(pid)
+    return kids
+
+
+def same_process(recorded, start):
+    """Is the process holding a pid now the one Claude recorded a start time for?"""
+    if not recorded:
+        return True
+    if USE_PROC:
+        return str(recorded) == start
+    rec = parse_lstart(recorded)
+    return rec is None or start is None or abs(rec - start) <= 5
+
+
+def live_claude_sessions():
+    """pid -> ~/.claude/sessions/<pid>.json record, for processes that are still alive."""
+    out = {}
+    for f in (CLAUDE_DIR / "sessions").glob("*.json"):
+        try:
+            d = json.loads(f.read_text())
+            pid = int(d["pid"])
+            d["sessionId"]
+        except Exception:
+            continue
+        st = proc_stat(pid)
+        if not st:
+            continue
+        if not same_process(d.get("procStart"), st[1]):
+            continue  # stale file, pid was reused
+        out[pid] = d
+    return out
+
+
+def find_claude(pane_pid, kids, live):
+    """Breadth-first search below the pane's shell for a Claude Code process."""
+    queue = [pane_pid]
+    while queue:
+        pid = queue.pop(0)
+        if pid in live and live[pid].get("kind", "interactive") == "interactive":
+            return pid
+        queue.extend(kids.get(pid, []))
     return None
 
 
-# --------------------------------------------------------------------------- live state
+def claude_argv(pid, strict=False):
+    """Arguments after the `claude` executable. strict=True: None if it isn't a claude process."""
+    argv = proc_argv(pid)
+    if not argv:
+        return None if strict else []
+    for i, a in enumerate(argv):
+        base = os.path.basename(a)
+        # The native install runs as .../claude/versions/<version>, so argv[0] may not be
+        # named "claude" at all.
+        if (base == "claude" or base.endswith(("cli.js", "cli.mjs"))
+                or (i == 0 and "/claude/versions/" in a)):
+            return argv[i + 1:]
+    return None if strict else argv[1:]
 
-def parse_lstart(text):
-    try:
-        return calendar.timegm(time.strptime(" ".join(text.split()), "%a %b %d %H:%M:%S %Y"))
-    except (ValueError, AttributeError):
-        return None
+
+def find_attach(pane_pid, kids):
+    """A pane running `claude attach <id|name>` has no session file; find it by cmdline."""
+    queue = [pane_pid]
+    while queue:
+        pid = queue.pop(0)
+        args = claude_argv(pid, strict=True)
+        if args and args[0] == "attach" and len(args) > 1:
+            return args[1]
+        queue.extend(kids.get(pid, []))
+    return None
 
 
-def process_table():
-    """pid -> {ppid, tty, start (epoch), command}. ps runs in UTC so start times
-    compare directly with the procStart Claude records for each session."""
-    env = dict(os.environ, LC_ALL="C", TZ="UTC")
-    rc, out, _ = run(["ps", "-A", "-ww", "-o", "pid=", "-o", "ppid=", "-o", "tty=",
-                      "-o", "lstart=", "-o", "command="], env=env)
-    procs = {}
-    for line in out.splitlines():
-        parts = line.split(None, 8)
-        if len(parts) < 8:
-            continue
+def resolve_job(ref):
+    """Map an attach argument (job id, or part of a job's name) to (job_id, state)."""
+    jobs = CLAUDE_DIR / "jobs"
+    if (jobs / ref).is_dir():
+        return ref, job_state(ref) or {}
+    for d in sorted(jobs.glob("*/state.json")):
         try:
-            pid, ppid = int(parts[0]), int(parts[1])
-        except ValueError:
+            st = json.loads(d.read_text())
+        except Exception:
             continue
-        procs[pid] = {
-            "ppid": ppid,
-            "tty": parts[2],
-            "start": parse_lstart(" ".join(parts[3:8])),
-            "command": parts[8] if len(parts) > 8 else "",
-        }
-    return procs
+        if ref.lower() in (st.get("name") or "").lower():
+            return d.parent.name, st
+    return ref, {}
 
 
-def looks_like_claude(command):
-    argv0 = command.split(" ", 1)[0]
-    return "claude" in os.path.basename(argv0).lower() or "/claude/versions/" in argv0
+# Flags we must not replay on restore (they pick/create a session, or a one-shot mode).
+DROP = {"-r", "--resume", "-c", "--continue", "--session-id", "--fork-session", "-n", "--name",
+        "-p", "--print", "--bg", "--background", "--from-pr", "--teleport", "--cloud",
+        "-w", "--worktree", "--tmux"}
+VALUE = {"--model", "--permission-mode", "--effort", "--agent", "--settings", "--setting-sources",
+         "--append-system-prompt", "--system-prompt", "--system-prompt-file",
+         "--append-system-prompt-file", "--fallback-model", "--output-format", "--input-format",
+         "--max-turns", "--max-budget-usd", "--session-id", "-n", "--name", "--tools",
+         "--json-schema", "--agents", "--permission-prompt-tool", "--plugin-url", "--environment"}
+VARIADIC = {"--add-dir", "--mcp-config", "--allowedTools", "--allowed-tools", "--disallowedTools",
+            "--disallowed-tools", "--plugin-dir", "--betas"}
+OPTIONAL = {"-r", "--resume", "-d", "--debug", "--remote-control", "-w", "--worktree",
+            "--from-pr", "--teleport", "--cloud"}
 
 
-def session_records(procs, allow_fallback=True):
-    """Claude's own per-process session records (~/.claude/sessions/<pid>.json),
-    filtered down to processes that are really still alive."""
-    recs = []
-    for path in glob.glob(os.path.join(glob.escape(os.path.join(CLAUDE_DIR, "sessions")), "*.json")):
-        try:
-            with open(path, encoding="utf-8") as fh:
-                d = json.load(fh)
-        except (OSError, ValueError):
-            continue
-        pid, sid = d.get("pid"), d.get("sessionId")
-        if not isinstance(pid, int) or not sid:
-            continue
-        p = procs.get(pid)
-        if not p or not looks_like_claude(p["command"]):
-            continue
-        # A recycled pid would have a different start time than the one recorded.
-        rec_start = parse_lstart(d.get("procStart") or "")
-        if rec_start and p["start"] and abs(rec_start - p["start"]) > 5:
-            continue
-        d["_tty"], d["_command"] = p["tty"], p["command"]
-        recs.append(d)
-    if recs or not allow_fallback:
-        return recs
-    # Fallback for Claude versions that do not write those files: the scripting
-    # listing. It knows less (no background-job link) but covers the basics.
-    if not any(looks_like_claude(p["command"]) and p["tty"] not in ("??", "?") for p in procs.values()):
-        return recs
-    claude = shutil.which("claude")
-    if not claude:
-        return recs
-    rc, out, _ = run([claude, "agents", "--json"], timeout=30)
-    try:
-        listing = json.loads(out) if rc == 0 else []
-    except ValueError:
-        listing = []
-    for a in listing if isinstance(listing, list) else []:
-        try:
-            pid = int(a.get("pid"))
-        except (TypeError, ValueError):
-            continue
-        p = procs.get(pid)
-        if not p or not a.get("sessionId"):
-            continue
-        recs.append({
-            "pid": pid, "sessionId": a["sessionId"], "cwd": a.get("cwd"), "name": a.get("name"),
-            "kind": "bg" if a.get("kind") == "background" else "interactive",
-            "jobId": a.get("id"), "status": a.get("status"),
-            "_tty": p["tty"], "_command": p["command"],
-        })
-    return recs
-
-
-def tmux_panes():
-    fmt = SEP.join("#{%s}" % f for f in PANE_FIELDS)
-    rc, out, _ = tmux("list-panes", "-a", "-F", fmt)
-    if rc != 0:
-        return []
-    rows = []
-    for line in out.splitlines():
-        vals = line.split(SEP)
-        if len(vals) == len(PANE_FIELDS):
-            rows.append(dict(zip(PANE_FIELDS, vals)))
-    return rows
-
-
-def tmux_server():
-    rc, out, _ = tmux("display-message", "-p", "#{pid} #{start_time}")
-    parts = out.split()
-    if rc != 0 or len(parts) != 2:
-        return None
-    try:
-        return {"pid": int(parts[0]), "start_time": int(parts[1])}
-    except ValueError:
-        return None
-
-
-def find_transcript(session_id):
-    hits = glob.glob(os.path.join(glob.escape(os.path.join(CLAUDE_DIR, "projects")), "*",
-                                  glob.escape(session_id) + ".jsonl"))
-    return max(hits, key=os.path.getmtime) if hits else None
-
-
-def transcript_state(path):
-    """Model and permission mode the conversation was last using, read from the
-    tail of its transcript."""
-    state = {}
-    try:
-        size = os.path.getsize(path)
-    except OSError:
-        return state
-    for window in (256 * 1024, 4 * 1024 * 1024):
-        try:
-            with open(path, "rb") as fh:
-                fh.seek(max(0, size - window))
-                lines = fh.read().decode("utf-8", "replace").splitlines()
-        except OSError:
-            return state
-        for line in reversed(lines):
-            if "permission_mode" not in state and '"permission-mode"' in line:
-                try:
-                    mode = json.loads(line).get("permissionMode")
-                except ValueError:
-                    mode = None
-                if mode:
-                    state["permission_mode"] = mode
-            elif "model" not in state and '"requestedModel"' in line:
-                try:
-                    e = json.loads(line)
-                except ValueError:
-                    continue
-                if e.get("type") == "assistant" and not e.get("isSidechain"):
-                    model = e.get("requestedModel") or (e.get("message") or {}).get("model")
-                    if model and not model.startswith("<"):
-                        state["model"] = model
-            if "model" in state and "permission_mode" in state:
-                return state
-        if size <= window:
+def sanitize_args(args):
+    """Keep the user's flags (e.g. --dangerously-skip-permissions, --model X), drop session
+    selectors and any positional prompt (which would otherwise be re-sent on resume)."""
+    out, i = [], 0
+    while i < len(args):
+        a = args[i]
+        if a == "--":
             break
-    return state
+        if not a.startswith("-"):
+            i += 1
+            continue
+        name = a.split("=", 1)[0]
+        vals = []
+        if not (a.startswith("--") and "=" in a):
+            if name in VARIADIC:
+                j = i + 1
+                while j < len(args) and not args[j].startswith("-"):
+                    vals.append(args[j])
+                    j += 1
+            elif name in VALUE and i + 1 < len(args):
+                vals.append(args[i + 1])
+            elif name in OPTIONAL and i + 1 < len(args) and not args[i + 1].startswith("-"):
+                vals.append(args[i + 1])
+        i += 1 + len(vals)
+        if name not in DROP:
+            out += [a] + vals
+    return out
 
 
-def restore_flags(command, tstate):
-    """The flags to relaunch a session with: its permission setup and model."""
-    argv = command.split()
-
-    def opt(name):
-        for i, a in enumerate(argv):
-            if a == name and i + 1 < len(argv):
-                return argv[i + 1]
-            if a.startswith(name + "="):
-                return a.split("=", 1)[1]
-        return None
-
-    skip = "--dangerously-skip-permissions" in argv
-    allow = skip or "--allow-dangerously-skip-permissions" in argv
-    mode = tstate.get("permission_mode") or opt("--permission-mode") or ("bypassPermissions" if skip else None)
-    flags = []
-    if mode == "bypassPermissions":
-        flags.append("--dangerously-skip-permissions")
-    else:
-        if allow:
-            flags.append("--allow-dangerously-skip-permissions")
-        if mode in RESTORABLE_MODES:
-            flags += ["--permission-mode", mode]
-    model = tstate.get("model") or opt("--model")
-    if model:
-        flags += ["--model", model]
-    return flags
+def transcript_exists(session_id):
+    return any((CLAUDE_DIR / "projects").glob(f"*/{session_id}.jsonl"))
 
 
 def job_state(job_id):
     try:
-        with open(os.path.join(CLAUDE_DIR, "jobs", job_id, "state.json"), encoding="utf-8") as fh:
-            st = json.load(fh)
-        return st if isinstance(st, dict) else {}
-    except (OSError, ValueError):
-        return {}
-
-
-def job_session_id(job_id):
-    st = job_state(job_id)
-    return st.get("resumeSessionId") or st.get("sessionId")
-
-
-def resolve_job(arg, bg_by_job):
-    """`claude attach` takes a job id or part of a session name; get the id."""
-    if arg in bg_by_job or job_state(arg):
-        return arg
-    needle = arg.lower()
-    for job, rec in bg_by_job.items():
-        if needle in (rec.get("name") or "").lower():
-            return job
-    for path in glob.glob(os.path.join(glob.escape(os.path.join(CLAUDE_DIR, "jobs")), "*", "state.json")):
-        job = os.path.basename(os.path.dirname(path))
-        if needle in (job_state(job).get("name") or "").lower():
-            return job
-    return None
-
-
-def attach_clients(procs, bg_by_job):
-    """tty -> job id, for terminals showing a background session through
-    `claude attach`. Those clients leave no session record of their own."""
-    found = {}
-    for p in procs.values():
-        argv = p["command"].split()
-        if len(argv) >= 3 and argv[1] == "attach" and looks_like_claude(p["command"]):
-            job = resolve_job(argv[2], bg_by_job)
-            if job and p["tty"] not in ("??", "?", ""):
-                found[p["tty"]] = job
-    return found
-
-
-def attached_entry(job, bg_by_job):
-    bg = bg_by_job.get(job) or {}
-    st = job_state(job)
-    sid = bg.get("sessionId") or st.get("resumeSessionId") or st.get("sessionId")
-    if not sid:
+        return json.loads((CLAUDE_DIR / "jobs" / job_id / "state.json").read_text())
+    except Exception:
         return None
-    path = find_transcript(sid)
-    return {
-        "session_id": sid,
-        "name": bg.get("name") or st.get("name"),
-        "name_source": bg.get("nameSource") or st.get("nameSource"),
-        "cwd": bg.get("cwd") or st.get("cwd"),
-        "status": bg.get("status"),
-        "version": bg.get("version"),
-        "pid": None,
-        "parked": {"job_id": job, "session_id": sid},
-        "flags": restore_flags("", transcript_state(path) if path else {}),
-    }
 
 
-def claude_entry(rec, bg_by_job):
-    sid = rec["sessionId"]
-    entry = {
-        "session_id": sid,
-        "name": rec.get("name"),
-        "name_source": rec.get("nameSource"),
-        "cwd": rec.get("cwd"),
-        "status": rec.get("status"),
-        "version": rec.get("version"),
-        "pid": rec.get("pid"),
-    }
-    # A pane whose conversation was sent to the background keeps showing it, but
-    # the conversation itself now lives in a background job with its own id.
-    lookup = [sid]
-    job = rec.get("parkedJobId")
-    if job:
-        bg = bg_by_job.get(job)
-        bg_sid = (bg or {}).get("sessionId") or job_session_id(job)
-        if bg_sid:
-            entry["parked"] = {"job_id": job, "session_id": bg_sid}
-            lookup.insert(0, bg_sid)
-    tstate = {}
-    for cand in lookup:
-        path = find_transcript(cand)
-        if path:
-            tstate = transcript_state(path)
-            break
-    entry["flags"] = restore_flags(rec.get("_command") or "", tstate)
-    return entry
+# ---------------------------------------------------------------- capture
 
+def capture():
+    wins = tmux_rows(["list-windows", "-a"],
+                     ["session_name", "window_index", "window_name", "window_layout",
+                      "window_active", "window_width", "window_height", "automatic-rename"])
+    panes = tmux_rows(["list-panes", "-a"],
+                      ["session_name", "window_index", "pane_index", "pane_pid",
+                       "pane_current_path", "pane_current_command", "pane_active"])
+    sess_rows = tmux_rows(["list-sessions"], ["session_name", "session_last_attached"])
+    if wins is None or panes is None or sess_rows is None:
+        return None
 
-def strip_dev(tty):
-    return tty[5:] if tty.startswith("/dev/") else tty
-
-
-def live_state():
-    procs = process_table()
-    recs = session_records(procs)
-    rows = tmux_panes()
-    bg_by_job = {r["jobId"]: r for r in recs if r.get("kind") == "bg" and r.get("jobId")}
-    return {"procs": procs, "recs": recs, "rows": rows, "bg_by_job": bg_by_job,
-            "attach": attach_clients(procs, bg_by_job)}
-
-
-# --------------------------------------------------------------------------- snapshots
-
-def take_snapshot(live=None):
-    live = live or live_state()
-    recs, rows = live["recs"], live["rows"]
-    interactive = [r for r in recs if r.get("kind") != "bg" and r["_tty"] not in ("??", "?", "")]
-    bg_by_job, attach = live["bg_by_job"], live["attach"]
-    by_tty = {}
-    for r in sorted(interactive, key=lambda r: r.get("startedAt") or 0):
-        by_tty[r["_tty"]] = r
-
-    used = set()
+    kids, live = children_map(), live_claude_sessions()
     sessions = {}
-    for row in rows:
-        s = sessions.setdefault(row["session_name"], {
-            "name": row["session_name"],
-            "attached": row["session_attached"] not in ("", "0"),
-            "windows": {},
-        })
-        w = s["windows"].setdefault(row["window_id"], {
-            "index": int(row["window_index"]),
-            "name": row["window_name"],
-            "auto_name": row["automatic-rename"] == "1",
-            "active": row["window_active"] == "1",
-            "layout": row["window_layout"],
-            "width": int(row["window_width"] or 0),
-            "height": int(row["window_height"] or 0),
-            "panes": [],
-        })
-        tty = strip_dev(row["pane_tty"])
-        rec = by_tty.get(tty)
-        claude = None
-        if rec:
-            used.add(rec["pid"])
-            claude = claude_entry(rec, bg_by_job)
-        elif tty in attach:
-            used.add(tty)
-            claude = attached_entry(attach[tty], bg_by_job)
-        w["panes"].append({
-            "index": int(row["pane_index"]),
-            "active": row["pane_active"] == "1",
-            "cwd": row["pane_current_path"],
-            "command": row["pane_current_command"],
-            "claude": claude,
-        })
+    for s in sess_rows:
+        sessions[s["session_name"]] = {"name": s["session_name"], "windows": {}}
+    for w in wins:
+        sessions[w["session_name"]]["windows"][w["window_index"]] = {
+            "index": int(w["window_index"]), "name": w["window_name"],
+            "layout": w["window_layout"], "active": w["window_active"] == "1",
+            "width": int(w["window_width"]), "height": int(w["window_height"]),
+            "auto_rename": w["automatic-rename"] == "1", "panes": []}
+    for p in panes:
+        pane = {"index": int(p["pane_index"]), "cwd": p["pane_current_path"] or str(HOME),
+                "active": p["pane_active"] == "1", "command": p["pane_current_command"]}
+        pid = find_claude(int(p["pane_pid"]), kids, live)
+        if pid:
+            rec = live[pid]
+            sid = rec["sessionId"]
+            c = {"session_id": sid, "name": rec.get("name"), "name_source": rec.get("nameSource"),
+                 "cwd": rec.get("cwd") or pane["cwd"],
+                 "args": sanitize_args(claude_argv(pid)), "had_transcript": transcript_exists(sid)}
+            if rec.get("parkedJobId"):
+                job = job_state(rec["parkedJobId"]) or {}
+                c["job_id"] = rec["parkedJobId"]
+                c["job_session_id"] = job.get("resumeSessionId") or job.get("sessionId")
+                c["job_name"] = job.get("name")
+            pane["claude"] = c
+        elif (ref := find_attach(int(p["pane_pid"]), kids)):
+            job_id, job = resolve_job(ref)
+            pane["claude"] = {"job_id": job_id, "job_name": job.get("name"),
+                              "job_session_id": job.get("resumeSessionId") or job.get("sessionId"),
+                              "session_id": None, "name": job.get("name"),
+                              "cwd": job.get("cwd") or pane["cwd"], "args": [], "attach": True}
+        sessions[p["session_name"]]["windows"][p["window_index"]]["panes"].append(pane)
 
-    tmux_list = []
-    for s in sorted(sessions.values(), key=lambda s: s["name"]):
-        wins = sorted(s["windows"].values(), key=lambda w: w["index"])
-        for w in wins:
+    out = []
+    for s in sessions.values():
+        wl = sorted(s["windows"].values(), key=lambda w: w["index"])
+        for w in wl:
             w["panes"].sort(key=lambda p: p["index"])
-        tmux_list.append({"name": s["name"], "attached": s["attached"], "windows": wins})
-
-    loose = [claude_entry(r, bg_by_job) for r in interactive if r["pid"] not in used]
-    loose += [attached_entry(job, bg_by_job) for tty, job in attach.items()
-              if tty not in used and tty not in by_tty]
-    loose = sorted((c for c in loose if c), key=lambda c: c["session_id"])
-
-    now = time.time()
-    snap = {
-        "ccsnap": SNAPSHOT_FORMAT,
-        "id": time.strftime("%Y%m%d-%H%M%S", time.localtime(now)),
-        "created": int(now),
-        "host": socket.gethostname(),
-        "boot_time": boot_time(),
-        "tmux_server": tmux_server() if rows else None,
-        "tmux": tmux_list,
-        "loose": loose,
-    }
-    snap["fingerprint"] = fingerprint(snap)
-    return snap
+        out.append({"name": s["name"], "windows": wl})
+    return out
 
 
-def fingerprint(snap):
-    """Hash of the parts worth a new snapshot. Leaves out what merely flickers
-    (pids, idle/busy, which pane has focus, auto-generated window titles)."""
-    def c(e):
-        return e and [e["session_id"], e.get("name"), e.get("cwd"), e.get("flags"), e.get("parked")]
-    core = {
-        "tmux": [[s["name"], [[w["index"], None if w.get("auto_name") else w["name"], w["layout"],
-                               [[p["index"], p["cwd"], c(p.get("claude"))] for p in w["panes"]]]
-                              for w in s["windows"]]] for s in snap["tmux"]],
-        "loose": [c(e) for e in snap["loose"]],
-    }
-    return hashlib.sha1(json.dumps(core, sort_keys=True).encode("utf-8")).hexdigest()
+def snap_counts(sessions):
+    panes = [p for s in sessions for w in s["windows"] for p in w["panes"]]
+    return len(panes), sum(1 for p in panes if "claude" in p)
 
 
-def snapshot_paths():
-    """Snapshot files, newest first."""
-    return sorted(glob.glob(os.path.join(glob.escape(SNAP_DIR), "*.json")), reverse=True)
+# ---------------------------------------------------------------- snapshot store
+
+_LOADED = {}
 
 
-def load_snapshot(path):
+def load(path):
+    """A snapshot as a dict, or None if the file is unreadable or is not one of ours (the
+    first, macOS-only ccsnap wrote a different format into the same folder)."""
+    key = str(path)
+    if key not in _LOADED:
+        try:
+            d = json.loads(Path(path).read_text())
+        except (OSError, ValueError):
+            d = None
+        ok = isinstance(d, dict) and isinstance(d.get("sessions"), list) and "saved_at" in d
+        _LOADED[key] = d if ok else None
+    return _LOADED[key]
+
+
+def snapshots():
+    """Paths of the usable snapshots, newest first."""
+    good = [p for p in SNAP_DIR.glob("*.json") if load(p)]
+    return sorted(good, key=lambda p: (load(p)["saved_at"], p.name), reverse=True)
+
+
+def boot_time():
+    if MAC:
+        try:
+            out = subprocess.run(["sysctl", "-n", "kern.boottime"], capture_output=True, text=True).stdout
+            return int(out.split("sec =")[1].split(",")[0])
+        except (OSError, IndexError, ValueError):
+            return 0
     try:
-        with open(path, encoding="utf-8") as fh:
-            snap = json.load(fh)
-    except (OSError, ValueError):
-        return None
-    if not isinstance(snap, dict) or "tmux" not in snap:
-        return None
-    snap.setdefault("loose", [])
-    snap.setdefault("id", os.path.basename(path)[:-5])
-    snap["_path"] = path
-    try:
-        snap["_seen"] = os.path.getmtime(path)
+        with open("/proc/stat") as f:
+            for line in f:
+                if line.startswith("btime"):
+                    return int(line.split()[1])
     except OSError:
-        snap["_seen"] = snap.get("created", 0)
-    return snap
-
-
-def all_snapshots():
-    return [s for s in (load_snapshot(p) for p in snapshot_paths()) if s]
-
-
-def resolve_snapshot(ref):
-    snaps = all_snapshots()
-    if not snaps:
-        die("no snapshots yet - run `ccsnap save` first")
-    if ref in (None, "latest"):
-        return snaps[0]
-    matches = [s for s in snaps if s["id"] == ref] or [s for s in snaps if s["id"].startswith(ref)]
-    if not matches:
-        die("no snapshot matches %r (see `ccsnap list`)" % ref)
-    if len(matches) > 1:
-        die("%r matches %d snapshots - be more specific" % (ref, len(matches)))
-    return matches[0]
-
-
-def claude_panes(snap):
-    return [p["claude"] for s in snap["tmux"] for w in s["windows"] for p in w["panes"] if p.get("claude")]
-
-
-def counts(snap):
-    panes = sum(len(w["panes"]) for s in snap["tmux"] for w in s["windows"])
-    return len(snap["tmux"]), panes, len(claude_panes(snap)), len(snap["loose"])
-
-
-def epoch_of(snap):
-    srv = snap.get("tmux_server") or {}
-    return "%s:%s" % (snap.get("boot_time"), srv.get("start_time"))
-
-
-def prune():
-    snaps = all_snapshots()  # newest first
-    keep = set(s["id"] for s in snaps[:KEEP_RECENT])
-    days, epochs = [], []
-    for s in snaps:
-        day = time.strftime("%Y%m%d", time.localtime(s.get("created", 0)))
-        if day not in days:
-            days.append(day)
-            if len(days) <= KEEP_DAYS:
-                keep.add(s["id"])
-        ep = epoch_of(s)
-        if ep not in epochs:
-            epochs.append(ep)
-            if len(epochs) <= KEEP_EPOCHS:
-                keep.add(s["id"])
-    for s in snaps:
-        if s["id"] not in keep:
-            try:
-                os.remove(s["_path"])
-            except OSError:
-                pass
-
-
-def cmd_save(args):
-    auto = getattr(args, "auto", False)
-    live = live_state()
-    snap = take_snapshot(live)
-    n_tmux, n_panes, n_claude, n_loose = counts(snap)
-    if not snap["tmux"] and not snap["loose"]:
-        if not auto:
-            print("Nothing to snapshot: no tmux sessions and no running Claude sessions.")
-        return 0
-    if auto and not snap["tmux"] and any(r.get("tmux") for r in live["recs"]):
-        # Claude says it is inside tmux but tmux could not be reached; a snapshot
-        # taken now would wrongly record every session as outside tmux.
-        print("%s tmux unreachable, snapshot skipped" % time.strftime("%Y-%m-%d %H:%M:%S"), file=sys.stderr)
-        return 1
-
-    os.makedirs(SNAP_DIR, exist_ok=True)
-    paths = snapshot_paths()
-    latest = load_snapshot(paths[0]) if paths else None
-    if latest and latest.get("fingerprint") == snap["fingerprint"]:
-        os.utime(latest["_path"], None)
-        if not auto:
-            print("No changes since snapshot %s (%s) - it is still current." % (latest["id"], when(latest["created"])))
-            print_counts(snap)
-        return 0
-
-    path = os.path.join(SNAP_DIR, snap["id"] + ".json")
-    n = 2
-    while os.path.exists(path):
-        path = os.path.join(SNAP_DIR, "%s-%d.json" % (snap["id"], n))
-        n += 1
-    snap["id"] = os.path.basename(path)[:-5]
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as fh:
-        json.dump(snap, fh, indent=1, ensure_ascii=False)
-    os.replace(tmp, path)
-    prune()
-    if not auto:
-        print("Saved snapshot %s" % snap["id"])
-        print_counts(snap)
+        pass
     return 0
 
 
-def print_counts(snap):
-    n_tmux, n_panes, n_claude, n_loose = counts(snap)
-    print("  tmux: %s, %s, %d running Claude" % (plural(n_tmux, "session"), plural(n_panes, "pane"), n_claude))
-    if n_loose:
-        print("  outside tmux: %s" % plural(n_loose, "Claude session"))
+MARKER = STATE_DIR / "restored-boot"
 
 
-def cmd_list(args):
-    snaps = all_snapshots()
-    if not snaps:
-        print("No snapshots yet. Run `ccsnap save`, or `ccsnap auto on` to take them automatically.")
+def boot_id():
+    try:
+        return Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+    except OSError:
+        return str(boot_time())  # no such file on macOS; the boot time identifies the boot
+
+
+def restored_this_boot():
+    try:
+        return MARKER.read_text().strip() == boot_id()
+    except OSError:
+        return False
+
+
+def snap_time(p):
+    try:
+        return load(p)["saved_at"]
+    except Exception:
         return 0
-    current_boot = boot_time()
-    print("%-18s %-17s %-10s %5s %6s %7s %6s" % ("ID", "SAVED", "LAST SEEN", "TMUX", "PANES", "CLAUDE", "LOOSE"))
-    for s in snaps:
-        n_tmux, n_panes, n_claude, n_loose = counts(s)
-        note = ""
-        if current_boot and s.get("boot_time") and abs(s["boot_time"] - current_boot) > 5:
-            note = "  before last restart"
-        print("%-18s %-17s %-10s %5d %6d %7d %6d%s" % (
-            s["id"], when(s.get("created", 0)), ago(s["_seen"]), n_tmux, n_panes, n_claude, n_loose, note))
-    return 0
 
 
-def describe_claude(c):
-    label = c.get("name") or c["session_id"][:8]
-    if c.get("parked"):
-        label += " (bg job %s)" % c["parked"]["job_id"]
-    return label
-
-
-def flag_summary(c):
-    flags = c.get("flags") or []
-    bits = []
-    if "--model" in flags:
-        bits.append(flags[flags.index("--model") + 1].replace("claude-", ""))
-    if "--dangerously-skip-permissions" in flags:
-        bits.append("bypass")
-    elif "--permission-mode" in flags:
-        bits.append(flags[flags.index("--permission-mode") + 1])
-    return " ".join(bits)
-
-
-def cmd_show(args):
-    snap = resolve_snapshot(args.snapshot)
-    print("Snapshot %s - saved %s, last seen %s" % (snap["id"], when(snap.get("created", 0)), ago(snap["_seen"])))
-    for s in snap["tmux"]:
-        print("\ntmux session %s%s" % (s["name"], "  (was attached)" if s.get("attached") else ""))
-        for w in s["windows"]:
-            if len(s["windows"]) > 1 or not w.get("auto_name"):
-                print("  window %d%s" % (w["index"], "" if w.get("auto_name") else "  " + w["name"]))
-            for p in w["panes"]:
-                c = p.get("claude")
-                loc = "%d.%d" % (w["index"], p["index"])
-                if c:
-                    print("    %-5s claude  %-34s %s  %-20s %s" % (
-                        loc, describe_claude(c), c["session_id"][:8], flag_summary(c), short(c.get("cwd") or p["cwd"])))
-                else:
-                    print("    %-5s shell   %s" % (loc, short(p["cwd"])))
-    if snap["loose"]:
-        print("\noutside tmux")
-        for c in snap["loose"]:
-            print("          claude  %-34s %s  %-20s %s" % (
-                describe_claude(c), c["session_id"][:8], flag_summary(c), short(c.get("cwd"))))
-    return 0
-
-
-# --------------------------------------------------------------------------- restore
-
-def launch_command(c, attach=True):
-    """(command to type, kind) that brings this conversation back."""
-    flags = " ".join(shlex.quote(f) for f in (c.get("flags") or []))
-    parked = c.get("parked")
-    # A conversation that was running as a background job goes back the same
-    # way: `claude attach` restarts the job if needed and shows it here.
-    if attach and parked and job_state(parked["job_id"]):
-        return "claude attach " + shlex.quote(parked["job_id"]), "attach"
-    for cand in ([parked["session_id"]] if parked else []) + [c["session_id"]]:
-        if find_transcript(cand):
-            return ("claude --resume %s %s" % (cand, flags)).rstrip(), "resume"
-    # The session never got as far as a saved message, so there is nothing to
-    # resume: start a fresh one in the same place.
-    cmd = "claude " + flags
-    if c.get("name") and c.get("name_source") == "user":
-        cmd += " -n " + shlex.quote(c["name"])
-    return cmd.rstrip(), "fresh"
-
-
-def build_plan(snap, live, only, include_loose):
-    front_ids = set(r["sessionId"] for r in live["recs"] if r.get("kind") != "bg")
-    all_ids = set(r["sessionId"] for r in live["recs"])
-    viewed_jobs = set(live["attach"].values()) | set(
-        r["parkedJobId"] for r in live["recs"] if r.get("parkedJobId") and r.get("kind") != "bg")
-    existing = set(row["session_name"] for row in live["rows"])
-
-    def running(c):
-        parked = c.get("parked")
-        if parked:
-            # A background job counts as "back" only when some terminal shows it;
-            # attaching to one that is still running in the background is safe.
-            return (parked["job_id"] in viewed_jobs or c["session_id"] in front_ids
-                    or parked["session_id"] in front_ids)
-        return c["session_id"] in all_ids
-
-    plan = {"create": [], "exists": [], "elsewhere": [], "loose": [], "manual": [], "unknown": []}
-    names = set(s["name"] for s in snap["tmux"])
-    plan["unknown"] = sorted(n for n in (only or []) if n not in names)
-    for s in snap["tmux"]:
-        if only and s["name"] not in only:
-            continue
-        cl = [(w, p) for w in s["windows"] for p in w["panes"] if p.get("claude")]
-        dead = [(w, p) for (w, p) in cl if not running(p["claude"])]
-        if s["name"] in existing:
-            plan["exists"].append(s["name"])
-            for w, p in dead:
-                if launch_command(p["claude"])[1] != "fresh":
-                    plan["manual"].append(("%s:%d.%d" % (s["name"], w["index"], p["index"]), p["claude"]))
-        elif cl and not dead:
-            plan["elsewhere"].append(s["name"])
-        else:
-            plan["create"].append(s)
-    if not only:
-        dead_loose = [c for c in snap["loose"] if not running(c) and launch_command(c)[1] != "fresh"]
-        if include_loose:
-            plan["loose"] = dead_loose
-        else:
-            plan["manual"] += [("outside tmux", c) for c in dead_loose]
-    plan["running"] = running
-    plan["actionable"] = bool(plan["create"] or plan["loose"])
-    return plan
-
-
-def manual_line(c, attach=True):
-    cmd, _ = launch_command(c, attach)
-    cwd = c.get("cwd")
-    return ("cd %s && %s" % (shlex.quote(cwd), cmd)) if cwd else cmd
-
-
-def print_plan(snap, plan):
-    print("Snapshot %s - saved %s, last seen %s" % (snap["id"], when(snap.get("created", 0)), ago(snap["_seen"])))
-    if plan["create"]:
-        n_panes = sum(len(w["panes"]) for s in plan["create"] for w in s["windows"])
-        print("\nWill rebuild %s (%s):" % (plural(len(plan["create"]), "tmux session"), plural(n_panes, "pane")))
-        width = max(len(s["name"]) for s in plan["create"])
-        for s in plan["create"]:
-            panes = [p for w in s["windows"] for p in w["panes"]]
-            labels = []
-            for p in panes:
-                c = p.get("claude")
-                if c:
-                    labels.append(describe_claude(c) + (" [already running, left as a shell]" if plan["running"](c) else ""))
-            shells = len(panes) - len(labels)
-            desc = ", ".join(labels)
-            if shells:
-                desc += (" + " if desc else "") + plural(shells, "shell")
-            print("  %-*s  %s" % (width, s["name"], desc))
-    if plan["loose"]:
-        print("\nWill open %s that ran outside tmux, in a tmux session named \"loose\":" % plural(len(plan["loose"]), "Claude session"))
-        for c in plan["loose"]:
-            print("  %s  (%s)" % (describe_claude(c), short(c.get("cwd"))))
-    if plan["exists"]:
-        print("\nAlready exist in tmux, left alone: " + ", ".join(plan["exists"]))
-    if plan["elsewhere"]:
-        print("Conversations already running elsewhere, skipped: " + ", ".join(plan["elsewhere"]))
-    if plan["unknown"]:
-        print("Not in this snapshot: " + ", ".join(plan["unknown"]))
-    if plan["manual"]:
-        print("\nNot part of this restore (--loose adds the ones from outside tmux). To reopen by hand:")
-        for where, c in plan["manual"]:
-            print("  # %s - %s\n  %s" % (describe_claude(c), where, manual_line(c)))
-
-
-def pane_dir(pane):
-    c = pane.get("claude")
-    for d in ((c or {}).get("cwd"), pane.get("cwd")):
-        if d and os.path.isdir(d):
-            return d
-    return HOME
-
-
-def create_tmux_session(s, running, launches, notes):
-    sess_id = None
-    active_window = None
-    for w in s["windows"]:
-        panes = w["panes"]
-        size = ["-x", str(w["width"]), "-y", str(w["height"])] if w.get("width") and w.get("height") else []
-        fmt = "#{session_id} #{window_id} #{window_index} #{pane_id} #{pane_tty}"
-        if sess_id is None:
-            rc, out, err = tmux("new-session", "-d", "-s", s["name"], *size, "-c", pane_dir(panes[0]), "-P", "-F", fmt)
-            if rc != 0:
-                notes.append("could not create tmux session %s: %s" % (s["name"], err))
-                return False
-            sess_id, win_id, win_index, pane_id, pane_tty = out.split()
-            if int(win_index) != w["index"]:
-                tmux("move-window", "-s", win_id, "-t", "%s:%d" % (sess_id, w["index"]))
-        else:
-            rc, out, err = tmux("new-window", "-d", "-t", "%s:%d" % (sess_id, w["index"]), "-c", pane_dir(panes[0]), "-P", "-F", fmt)
-            if rc != 0:
-                rc, out, err = tmux("new-window", "-d", "-t", sess_id + ":", "-c", pane_dir(panes[0]), "-P", "-F", fmt)
-            if rc != 0:
-                notes.append("could not create window %d in %s: %s" % (w["index"], s["name"], err))
-                continue
-            _, win_id, win_index, pane_id, pane_tty = out.split()
-        made = [(pane_id, pane_tty)]
-        for p in panes[1:]:
-            args = ("split-window", "-d", "-t", made[-1][0], "-c", pane_dir(p), "-P", "-F", "#{pane_id} #{pane_tty}")
-            rc, out, err = tmux(*args)
-            if rc != 0:  # no room: even the panes out and try once more
-                tmux("select-layout", "-t", win_id, "tiled")
-                rc, out, err = tmux(*args)
-            if rc != 0:
-                notes.append("could not create pane %d.%d in %s: %s" % (w["index"], p["index"], s["name"], err))
-                break
-            made.append(tuple(out.split()))
-            tmux("select-layout", "-t", win_id, "tiled")
-        if len(made) == len(panes) and len(panes) > 1 and w.get("layout"):
-            tmux("select-layout", "-t", win_id, w["layout"])
-        if not w.get("auto_name") and w.get("name"):
-            tmux("rename-window", "-t", win_id, w["name"])
-        for p, (pid_, tty) in zip(panes, made):
-            if p.get("active"):
-                tmux("select-pane", "-t", pid_)
-            c = p.get("claude")
-            if not c:
-                continue
-            where = "%s:%d.%d" % (s["name"], w["index"], p["index"])
-            if running(c):
-                notes.append("%s: %s is already running elsewhere, pane left as a shell" % (where, describe_claude(c)))
-            elif c.get("cwd") and not os.path.isdir(c["cwd"]):
-                notes.append("%s: %s not resumed, its directory is gone (%s)" % (where, describe_claude(c), c["cwd"]))
-            else:
-                launches.append({"where": where, "pane": pid_, "tty": strip_dev(tty), "claude": c})
-        if w.get("active"):
-            active_window = win_id
-    if active_window:
-        tmux("select-window", "-t", active_window)
-    return True
-
-
-def create_loose_session(entries, existing, launches, notes):
-    name, n = "loose", 2
-    while name in existing:
-        name, n = "loose-%d" % n, n + 1
-    sess_id = None
-    for c in entries:
-        cwd = c.get("cwd") if c.get("cwd") and os.path.isdir(c["cwd"]) else None
-        if not cwd:
-            notes.append("%s not resumed, its directory is gone (%s)" % (describe_claude(c), c.get("cwd")))
-            continue
-        fmt = "#{session_id} #{window_index} #{pane_id} #{pane_tty}"
-        if sess_id is None:
-            rc, out, err = tmux("new-session", "-d", "-s", name, "-c", cwd, "-P", "-F", fmt)
-        else:
-            rc, out, err = tmux("new-window", "-d", "-t", sess_id + ":", "-c", cwd, "-P", "-F", fmt)
-        if rc != 0:
-            notes.append("could not open a window for %s: %s" % (describe_claude(c), err))
-            continue
-        sess_id, win_index, pane_id, pane_tty = out.split()
-        launches.append({"where": "%s:%s.0" % (name, win_index), "pane": pane_id, "tty": strip_dev(pane_tty), "claude": c})
-    return name if sess_id else None
-
-
-def wait_for_claude(launch, kind, timeout):
-    """Wait until the conversation is up: a session registered on the pane's
-    terminal, or for `claude attach`, its background job alive and the pane
-    showing it."""
-    job = (launch["claude"].get("parked") or {}).get("job_id")
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        time.sleep(0.7)
-        for r in session_records(process_table(), allow_fallback=False):
-            if kind == "attach":
-                if r.get("kind") == "bg" and r.get("jobId") == job and pane_command(launch["pane"]) not in SHELLS:
-                    return r
-            elif r["_tty"] == launch["tty"] and r.get("kind") != "bg":
-                return r
-    return None
-
-
-def pane_command(pane):
-    rc, out, _ = tmux("display-message", "-p", "-t", pane, "#{pane_current_command}")
-    return out.strip() if rc == 0 else ""
-
-
-def run_launches(launches, wait):
-    """Start the conversations one at a time: each waits for the previous one to
-    come up, so a dozen resumes do not all load at the same moment."""
-    if not launches:
-        return []
-    print("\nResuming %s, one at a time:" % plural(len(launches), "Claude session"))
-    width = max(len(l["where"]) for l in launches)
-    failed, misses = [], 0
-    for l in launches:
-        c = l["claude"]
-        cmd, kind = launch_command(c)
-        label = describe_claude(c) + (" (new session: nothing was saved to resume)" if kind == "fresh" else "")
-        sys.stdout.write("  %-*s  %s ... " % (width, l["where"], label))
-        sys.stdout.flush()
-        tmux("send-keys", "-t", l["pane"], "-l", "--", cmd)
-        tmux("send-keys", "-t", l["pane"], "Enter")
-        # Once two in a row fail to confirm, assume confirmation itself is not
-        # working (e.g. a Claude version that registers differently) and stop
-        # spending the full wait on each remaining one.
-        rec = wait_for_claude(l, kind, wait if misses < 2 else min(wait, 4))
-        if rec:
-            misses = 0
-            print("ok")
-            time.sleep(1.0)
-        else:
-            misses += 1
-            if pane_command(l["pane"]) in SHELLS:
-                print("DID NOT START")
-                failed.append(l)
-            else:
-                print("started (not confirmed, check the pane)")
-    return failed
-
-
-def cmd_restore(args):
-    if not tmux_bin():
-        die("tmux not found")
-    only = []
-    for item in args.only or []:
-        only += [x for x in item.split(",") if x]
-    live = live_state()
-    if args.snapshot:
-        snap = resolve_snapshot(args.snapshot)
-        plan = build_plan(snap, live, only, args.loose)
-        newest = True
-    else:
-        snaps = all_snapshots()
-        if not snaps:
-            die("no snapshots yet - run `ccsnap save` first")
-        snap = plan = None
-        for i, cand in enumerate(snaps):
-            cand_plan = build_plan(cand, live, only, args.loose)
-            if cand_plan["actionable"]:
-                snap, plan, newest = cand, cand_plan, i == 0
-                break
-        if snap is None:
-            snap, plan, newest = snaps[0], build_plan(snaps[0], live, only, args.loose), True
-
-    print_plan(snap, plan)
-    if not plan["actionable"]:
-        print("\nNothing to restore: the tmux sessions in this snapshot are already there.")
-        return 0
-    if not newest:
-        print("\nNote: newer snapshots exist, but everything in them is already running;"
-              "\nthis is the most recent one holding something that is not.")
-    if args.dry_run:
-        lines = ["%s:%d.%d  %s" % (s["name"], w["index"], p["index"], launch_command(p["claude"])[0])
-                 for s in plan["create"] for w in s["windows"] for p in w["panes"]
-                 if p.get("claude") and not plan["running"](p["claude"])]
-        lines += ["loose  %s" % launch_command(c)[0] for c in plan["loose"]]
-        print("\nDry run. Commands that would be typed into the new panes:")
-        print("\n".join("  " + l for l in lines) if lines else "  (none: shell panes only)")
-        return 0
-    if not args.yes:
-        if not sys.stdin.isatty():
-            die("not a terminal - re-run with -y to restore without asking")
-        prompt = "\nProceed? [Y/n] " if newest else "\nProceed? [y/N] "
+def default_snapshot(snaps, current):
+    """Until a restore has succeeded in this boot, only snapshots from *before* the reboot
+    count: the timer keeps saving while the machine comes up, and those post-boot snapshots
+    are the empty/broken state, not the one you want back. Among the candidates, take the
+    newest one with a tmux session that isn't running now (else the newest candidate)."""
+    cands = snaps
+    if not restored_this_boot():
+        bt = boot_time()
+        cands = [p for p in snaps if snap_time(p) < bt] or snaps
+    for p in cands:
         try:
-            answer = input(prompt).strip().lower()
-        except (EOFError, KeyboardInterrupt):
-            print()
-            return 1
-        if answer not in ("y", "yes") and not (newest and answer == ""):
-            print("Nothing done.")
-            return 1
-
-    launches, notes, created = [], [], []
-    for s in plan["create"]:
-        if create_tmux_session(s, plan["running"], launches, notes):
-            created.append(s["name"])
-    if plan["loose"]:
-        existing = set(row["session_name"] for row in live["rows"]) | set(created)
-        name = create_loose_session(plan["loose"], existing, launches, notes)
-        if name:
-            created.append(name)
-    if created:
-        print("\nBuilt tmux %s: %s" % ("session" if len(created) == 1 else "sessions", ", ".join(created)))
-        time.sleep(1.0)  # let the new shells finish starting up
-    failed = run_launches(launches, args.wait)
-
-    for n in notes:
-        print("  note: " + n)
-    if failed:
-        print("\nThese did not start. Look at the pane for the error, or run by hand:")
-        for l in failed:
-            print("  # %s\n  %s" % (l["where"], manual_line(l["claude"], attach=False)))
-    if created:
-        print("\nDone. Attach with:")
-        for name in created:
-            print("  tmux attach -t %s" % shlex.quote(name))
-    return 1 if failed else 0
+            if any(s["name"] not in current for s in load(p)["sessions"]):
+                return p
+        except Exception:
+            continue
+    return cands[0] if cands else None
 
 
-# --------------------------------------------------------------------------- auto (launchd)
-
-def auto_loaded():
-    rc, _, _ = run(["launchctl", "print", "gui/%d/%s" % (os.getuid(), LAUNCHD_LABEL)])
-    return rc == 0
+def needed_dirs(sess):
+    return {p["claude"]["cwd"] if "claude" in p else p["cwd"]
+            for w in sess["windows"] for p in w["panes"]}
 
 
-def cmd_auto(args):
-    script = os.path.realpath(__file__)
-    if sys.platform != "darwin":
-        print("Automatic snapshots are set up through launchd, which this system does not have.\n"
-              "Add a cron entry instead (crontab -e):\n  */5 * * * * %s save --auto" % script)
-        return 1
-    domain = "gui/%d" % os.getuid()
-    if args.action == "status":
-        if auto_loaded():
-            interval = "?"
-            try:
-                with open(LAUNCHD_PLIST, "rb") as fh:
-                    interval = "%d min" % (plistlib.load(fh).get("StartInterval", 0) // 60)
-            except (OSError, ValueError):
-                pass
-            print("Automatic snapshots: on (every %s)" % interval)
-        else:
-            print("Automatic snapshots: off  (turn on with `ccsnap auto on`)")
-        paths = snapshot_paths()
-        latest = load_snapshot(paths[0]) if paths else None
-        if latest:
-            print("Latest snapshot: %s, last seen %s" % (latest["id"], ago(latest["_seen"])))
-        return 0
-    if args.action == "off":
-        run(["launchctl", "bootout", "%s/%s" % (domain, LAUNCHD_LABEL)])
+def resolve_snapshot(ref, snaps, current):
+    if ref is None:
+        return default_snapshot(snaps, current)
+    if ref.isdigit() and 1 <= int(ref) <= len(snaps):
+        return snaps[int(ref) - 1]
+    p = Path(ref)
+    if p.is_file():
+        if not load(p):
+            sys.exit(f"ccsnap: {ref} is not a ccsnap snapshot")
+        return p
+    hits = [s for s in snaps if s.stem.startswith(ref)]   # e.g. 20261116-09
+    if len(hits) == 1:
+        return hits[0]
+    if hits:
+        sys.exit(f"ccsnap: '{ref}' matches {len(hits)} snapshots, be more specific")
+    sys.exit(f"ccsnap: no snapshot '{ref}' (see `ccsnap list`)")
+
+
+# ---------------------------------------------------------------- commands
+
+def cmd_save(a):
+    a.quiet = a.quiet or a.auto
+    sessions = capture()
+    if sessions is None:
+        if not a.quiet:
+            print("ccsnap: no tmux server running — nothing saved")
+        return
+    snaps = snapshots()
+    if snaps and not a.force:
         try:
-            os.remove(LAUNCHD_PLIST)
+            if load(snaps[0])["sessions"] == sessions:
+                if not a.quiet:
+                    print(f"unchanged since {snaps[0].name} — not saved again")
+                return
+        except Exception:
+            pass
+    SNAP_DIR.mkdir(parents=True, exist_ok=True)
+    now = time.time()
+    stem = datetime.fromtimestamp(now).strftime("%Y%m%d-%H%M%S")
+    path, n = SNAP_DIR / (stem + ".json"), 2
+    while path.exists():  # never overwrite: a second save in the same second, or a foreign file
+        path, n = SNAP_DIR / f"{stem}-{n}.json", n + 1
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps({"version": 1, "saved_at": now, "sessions": sessions}, indent=1))
+    tmp.replace(path)
+    for old in snapshots()[KEEP:]:
+        try:
+            old.unlink()
         except OSError:
             pass
-        print("Automatic snapshots: off. Existing snapshots are kept in %s" % short(SNAP_DIR))
-        return 0
+    if not a.quiet:
+        n_panes, n_claude = snap_counts(sessions)
+        print(f"saved {path}\n  {len(sessions)} tmux sessions, {n_panes} panes, "
+              f"{n_claude} Claude sessions")
 
-    minutes = max(1, args.every)
-    # Prefer the system Python: it does not move when a conda/pyenv setup changes.
-    python = sys.executable
-    if os.path.exists("/usr/bin/python3") and run(["/usr/bin/python3", "-c", "pass"])[0] == 0:
-        python = "/usr/bin/python3"
+
+def cmd_list(a):
+    snaps = snapshots()
+    if not snaps:
+        print("no snapshots yet — run `ccsnap save`, or `ccsnap auto on` to take them automatically")
+        return
+    current, bt = current_session_names(), boot_time()
+    dflt = default_snapshot(snaps, current)
+    print("    #  saved                claude  tmux sessions (panes)")
+    shown_boot = False
+    for i, p in enumerate(snaps[:a.n], 1):
+        d = load(p)
+        if not shown_boot and d["saved_at"] < bt and i > 1:
+            print("    ---- last boot " + datetime.fromtimestamp(bt).strftime("%Y-%m-%d %H:%M") + " ----")
+        shown_boot = shown_boot or d["saved_at"] < bt
+        _, n_claude = snap_counts(d["sessions"])
+        sess = " ".join(f"{s['name']}({sum(len(w['panes']) for w in s['windows'])})"
+                        for s in d["sessions"])
+        mark = "*" if p == dflt else " "
+        when = datetime.fromtimestamp(d["saved_at"]).strftime("%Y-%m-%d %H:%M:%S")
+        print(f"  {mark}{i:>3}  {when}  {n_claude:>6}  {sess}")
+    why = ("newest with a tmux session that isn't running now" if restored_this_boot()
+           else "last one from before the reboot — nothing restored yet this boot")
+    print(f"\n  * = what `ccsnap restore` picks by default ({why})")
+    if all(s["name"] in current for s in load(dflt)["sessions"]):
+        print("  all its tmux sessions exist right now — `ccsnap restore --replace` rebuilds them")
+
+
+def launch_cmd(pane, claude_bin):
+    """Return (command, note) to type into a restored pane, or (None, None)."""
+    c = pane.get("claude")
+    if not c:
+        return None, None
+    if c.get("job_id"):
+        if (CLAUDE_DIR / "jobs" / c["job_id"]).is_dir():
+            return f"{claude_bin} attach {shlex.quote(c['job_id'])}", f"background job {c.get('job_name') or ''}".strip()
+        sid = c.get("job_session_id") or c["session_id"]
+        if not sid:  # unresolvable job reference: let `claude attach` try it as given
+            return f"{claude_bin} attach {shlex.quote(c['job_id'])}", "background job (unresolved)"
+    else:
+        sid = c["session_id"]
+    parts = [claude_bin]
+    note = c.get("name") or ""
+    if transcript_exists(sid):
+        parts += ["--resume", sid]
+    else:
+        note = (note + " (no transcript yet → fresh session)").strip()
+        if c.get("name") and c.get("name_source") == "user":
+            parts += ["-n", shlex.quote(c["name"])]  # resumed sessions get their name from the transcript
+    parts += [shlex.quote(x) for x in c.get("args", [])]
+    return " ".join(parts), note
+
+
+def print_plan(snap, claude_bin, only=None, current=()):
+    for s in snap["sessions"]:
+        if only and s["name"] not in only:
+            continue
+        tag = "   (exists now → skipped)" if s["name"] in current else ""
+        print(f"tmux session {s['name']}{tag}")
+        for w in s["windows"]:
+            print(f"  window {w['index']}: {w['name']}  ({len(w['panes'])} panes)")
+            for p in w["panes"]:
+                cmd, note = launch_cmd(p, claude_bin)
+                cwd = p["claude"]["cwd"] if "claude" in p else p["cwd"]
+                what = f"{cmd}   # {note}" if cmd else f"shell (was: {p['command']})"
+                print(f"    .{p['index']}  {cwd}\n         {what}")
+
+
+def cmd_show(a):
+    snaps = snapshots()
+    if not snaps:
+        sys.exit("ccsnap: no snapshots yet")
+    current = current_session_names()
+    path = resolve_snapshot(a.snapshot, snaps, current)
+    snap = load(path)
+    print(f"{path}  (saved {datetime.fromtimestamp(snap['saved_at']):%Y-%m-%d %H:%M:%S})\n")
+    print_plan(snap, a.claude_bin, current=current)
+
+
+def cmd_restore(a):
+    snaps = snapshots()
+    if not snaps:
+        sys.exit("ccsnap: no snapshots yet — nothing to restore")
+    current = current_session_names()
+    path = resolve_snapshot(a.snapshot, snaps, current)
+    snap = load(path)
+    print(f"snapshot {path.name}  (saved {datetime.fromtimestamp(snap['saved_at']):%Y-%m-%d %H:%M:%S})")
+
+    todo = [s for s in snap["sessions"] if (not a.only or s["name"] in a.only)]
+    if a.only:
+        for m in sorted(set(a.only) - {s["name"] for s in snap["sessions"]}):
+            print(f"  skip {m}: not in this snapshot")
+    replace = []
+    if a.replace:
+        here = None
+        if os.environ.get("TMUX_PANE") and not TMUX_SOCKET:
+            here = tmux("display", "-p", "-t", os.environ["TMUX_PANE"], "#{session_name}",
+                        check=False).stdout.strip()
+        replace = [s for s in todo if s["name"] in current and s["name"] != here]
+        if here and here in current and any(s["name"] == here for s in todo):
+            print(f"  skip {here}: ccsnap is running inside it, won't kill it")
+    for s in todo:
+        if s["name"] in current and s not in replace:
+            print(f"  skip {s['name']}: a tmux session with that name already exists"
+                  + ("" if a.replace else " (--replace to rebuild it)"))
+    todo = [s for s in todo if s["name"] not in current or s in replace]
+    if not todo:
+        print("nothing to restore")
+        return
+
+    # Never launch Claude in the wrong folder: wait for missing folders (e.g. a data disk
+    # still being fsck'd/mounted after boot), and skip sessions whose folders never appear.
+    def missing_dirs():
+        return {d for s in todo for d in needed_dirs(s) if not os.path.isdir(d)}
+    gone = missing_dirs()
+    if gone and not a.dry_run and a.wait > 0:
+        print(f"waiting up to {a.wait}s for {len(gone)} folder(s) to appear (disk still mounting?):")
+        for d in sorted(gone)[:6]:
+            print(f"    {d}")
+        deadline, next_note = time.time() + a.wait, time.time() + 30
+        while gone and time.time() < deadline:
+            time.sleep(2)
+            gone = missing_dirs()
+            if gone and time.time() >= next_note:
+                print(f"  still waiting… ({int(deadline - time.time())}s left)")
+                next_note += 30
+        if not gone:
+            print("  all folders present — continuing")
+    failed = False
+    if gone:
+        for s in [s for s in todo if needed_dirs(s) & gone]:
+            print(f"  skip {s['name']}: folder not found: {', '.join(sorted(needed_dirs(s) & gone))}")
+            failed = True
+        todo = [s for s in todo if not needed_dirs(s) & gone]
+        replace = [s for s in replace if s in todo]
+    if not todo:
+        print("nothing restored — re-run `ccsnap restore` once the folders exist")
+        sys.exit(1)
+    if a.dry_run:
+        print()
+        if replace:
+            print("would kill and rebuild: " + " ".join(s["name"] for s in replace) + "\n")
+        print_plan({"sessions": todo}, a.claude_bin)
+        return
+
+    if replace:
+        names = " ".join(s["name"] for s in replace)
+        if not a.yes:
+            if not sys.stdin.isatty():
+                sys.exit(f"ccsnap: --replace would kill: {names} — add -y to confirm")
+            if input(f"kill and rebuild these tmux sessions: {names} ? [y/N] ").strip().lower() != "y":
+                sys.exit("aborted")
+        kids, live = children_map(), live_claude_sessions()
+        doomed = set()
+        for s in replace:
+            for r in tmux_rows(["list-panes", "-s", "-t", f"={s['name']}"], ["pane_pid"]) or []:
+                q = [int(r["pane_pid"])]
+                while q:
+                    pid = q.pop()
+                    doomed.add(pid)
+                    q.extend(kids.get(pid, []))
+            tmux("kill-session", "-t", f"={s['name']}", check=False)
+            print(f"  killed {s['name']}")
+        deadline = time.time() + 15  # let the old claude processes exit before resuming them
+        while time.time() < deadline and any(proc_stat(p) for p in doomed & set(live)):
+            time.sleep(0.5)
+
+    live = live_claude_sessions()
+    running = {d.get("sessionId") for d in live.values()}
+    launches = []   # (pane_id, cmd, press_enter, label)
+    for s in todo:
+        active_win = None
+        for wi, w in enumerate(s["windows"]):
+            panes = w["panes"]
+            cwds = [p["claude"]["cwd"] if "claude" in p else p["cwd"] for p in panes]
+            fmt = "#{window_id}\t#{pane_id}"
+            if wi == 0:
+                out = tmux("new-session", "-d", "-P", "-F", fmt, "-s", s["name"], "-n", w["name"],
+                           "-c", cwds[0], "-x", w["width"], "-y", w["height"]).stdout
+                wid, first = out.strip().split("\t")
+                idx = tmux("display", "-p", "-t", wid, "#{window_index}").stdout.strip()
+                if idx != str(w["index"]):
+                    tmux("move-window", "-s", wid, "-t", f"={s['name']}:{w['index']}")
+            else:
+                out = tmux("new-window", "-d", "-P", "-F", fmt, "-t", f"={s['name']}:{w['index']}",
+                           "-n", w["name"], "-c", cwds[0]).stdout
+                wid, first = out.strip().split("\t")
+            tmux("resize-window", "-t", wid, "-x", w["width"], "-y", w["height"], check=False)
+            pane_ids, last = [first], first
+            for cwd in cwds[1:]:
+                # split the *last* pane so pane index order == creation order == saved order
+                last = tmux("split-window", "-d", "-P", "-F", "#{pane_id}", "-t", last,
+                            "-c", cwd).stdout.strip()
+                pane_ids.append(last)
+                tmux("select-layout", "-t", wid, "tiled", check=False)
+            r = tmux("select-layout", "-t", wid, w["layout"], check=False)
+            if r.returncode != 0:
+                print(f"  warn {s['name']}:{w['index']}: couldn't reapply layout ({r.stderr.strip()}); tiled instead")
+            tmux("set-option", "-w", "-u", "-t", wid, "window-size", check=False)
+            if w.get("auto_rename"):
+                tmux("set-option", "-w", "-t", wid, "automatic-rename", "on", check=False)
+            for p, pid in zip(panes, pane_ids):
+                if p.get("active"):
+                    tmux("select-pane", "-t", pid, check=False)
+                cmd, note = launch_cmd(p, a.claude_bin)
+                if cmd:
+                    sid = p["claude"].get("session_id")
+                    clash = (not p["claude"].get("job_id")) and sid in running and not a.force
+                    label = f"{s['name']}:{w['index']}.{p['index']}"
+                    if clash:
+                        note = f"{note} — ALREADY RUNNING elsewhere, typed but not started".strip(" —")
+                    launches.append((pid, cmd, not (clash or a.no_enter), f"{label}  {note}".rstrip()))
+            if w.get("active"):
+                active_win = wid
+        if active_win:
+            tmux("select-window", "-t", active_win, check=False)
+        print(f"  created {s['name']}: {len(s['windows'])} window(s), "
+              f"{sum(len(w['panes']) for w in s['windows'])} pane(s)")
+
+    if launches:
+        time.sleep(a.settle)  # let the new shells finish starting before typing into them
+        print(f"\n{'typing' if a.no_enter else 'starting'} {len(launches)} Claude session(s):")
+        for pid, cmd, enter, label in launches:
+            tmux("send-keys", "-t", pid, "-l", cmd)
+            if enter:
+                tmux("send-keys", "-t", pid, "Enter")
+                time.sleep(a.stagger)
+            print(f"  {'▶' if enter else '·'} {label}")
+
+    try:  # from now on in this boot, `restore` may default to snapshots taken after the reboot
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        MARKER.write_text(boot_id())
+    except OSError:
+        pass
+    if failed:
+        print("\nsome sessions were skipped (see above) — re-run `ccsnap restore` when their folders exist")
+
+    first = todo[0]["name"]
+    if a.attach:
+        if os.environ.get("TMUX") and not TMUX_SOCKET:
+            tmux("switch-client", "-t", first, check=False)
+        else:
+            os.execvp(tmux_bin(), ["tmux"] + (["-L", TMUX_SOCKET] if TMUX_SOCKET else []) + ["attach", "-t", first])
+    else:
+        sock = f" -L {shlex.quote(TMUX_SOCKET)}" if TMUX_SOCKET else ""
+        verb = "switch-client" if os.environ.get("TMUX") and not TMUX_SOCKET else "attach"
+        print(f"\ndone. jump in with:  tmux{sock} {verb} -t {shlex.quote(first)}")
+        if failed:
+            sys.exit(1)
+
+
+# ---------------------------------------------------------------- autosave
+
+SERVICE = """[Unit]
+Description=ccsnap: snapshot tmux + Claude Code sessions
+
+[Service]
+Type=oneshot
+ExecStart="{python}" "{script}" save --quiet
+LogLevelMax=notice
+"""
+TIMER = """[Unit]
+Description=ccsnap: snapshot tmux + Claude Code sessions every {mins} min
+
+[Timer]
+OnStartupSec=1min
+OnUnitActiveSec={mins}min
+AccuracySec=10s
+
+[Install]
+WantedBy=timers.target
+"""
+
+
+def stable_python():
+    """The interpreter autosave should run under. The system Python is preferred: it stays
+    put when a conda or pyenv setup changes."""
+    if os.path.exists("/usr/bin/python3"):
+        try:
+            if subprocess.run(["/usr/bin/python3", "-c", "pass"], capture_output=True).returncode == 0:
+                return "/usr/bin/python3"
+        except OSError:
+            pass
+    return sys.executable
+
+
+def quiet(cmd):
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True)
+    except OSError as e:
+        return subprocess.CompletedProcess(cmd, 127, "", str(e))
+
+
+def latest_line():
+    snaps = snapshots()
+    if snaps:
+        print(f"latest snapshot: {datetime.fromtimestamp(load(snaps[0])['saved_at']):%Y-%m-%d %H:%M:%S}"
+              f"  ({len(snaps)} kept in {SNAP_DIR})")
+
+
+def have_systemd_user():
+    return bool(shutil.which("systemctl")) and quiet(["systemctl", "--user", "show-environment"]).returncode == 0
+
+
+def systemd_auto(action, every):
+    if action == "status":
+        on = quiet(["systemctl", "--user", "is-active", "ccsnap.timer"]).stdout.strip() == "active"
+        mins = "?"
+        try:
+            for line in (UNIT_DIR / "ccsnap.timer").read_text().splitlines():
+                if line.startswith("OnUnitActiveSec="):
+                    mins = line.split("=", 1)[1].replace("min", "")
+        except OSError:
+            pass
+        print(f"autosave: on, every {mins} min (systemd timer)" if on
+              else "autosave: off  (turn on with `ccsnap auto on`)")
+        latest_line()
+        return
+    if action == "off":
+        subprocess.run(["systemctl", "--user", "disable", "--now", "ccsnap.timer"], check=False)
+        for f in ("ccsnap.timer", "ccsnap.service"):
+            try:
+                (UNIT_DIR / f).unlink()
+            except OSError:
+                pass
+        subprocess.run(["systemctl", "--user", "daemon-reload"], check=False)
+        print(f"autosave off (snapshots kept in {SNAP_DIR})")
+        return
+    UNIT_DIR.mkdir(parents=True, exist_ok=True)
+    (UNIT_DIR / "ccsnap.service").write_text(
+        SERVICE.format(python=stable_python(), script=Path(__file__).resolve()))
+    (UNIT_DIR / "ccsnap.timer").write_text(TIMER.format(mins=every))
+    subprocess.run(["systemctl", "--user", "daemon-reload"], check=True)
+    subprocess.run(["systemctl", "--user", "enable", "--now", "ccsnap.timer"], check=True)
+    subprocess.run(["systemctl", "--user", "start", "ccsnap.service"], check=False)
+    print(f"autosave on: every {every} min → {SNAP_DIR}")
+    subprocess.run(["systemctl", "--user", "list-timers", "ccsnap.timer", "--no-pager"])
+
+
+def launchd_auto(action, every):
+    """macOS: a launchd agent that runs `ccsnap save --quiet` on an interval and at login."""
+    domain = f"gui/{os.getuid()}"
+    target = f"{domain}/{LAUNCHD_LABEL}"
+    if action == "status":
+        if quiet(["launchctl", "print", target]).returncode == 0:
+            mins = "?"
+            try:
+                with open(LAUNCHD_PLIST, "rb") as fh:
+                    mins = plistlib.load(fh).get("StartInterval", 0) // 60
+            except (OSError, ValueError):
+                pass
+            print(f"autosave: on, every {mins} min (launchd agent {LAUNCHD_LABEL})")
+        else:
+            print("autosave: off  (turn on with `ccsnap auto on`)")
+        latest_line()
+        return
+    if action == "off":
+        quiet(["launchctl", "bootout", target])
+        try:
+            LAUNCHD_PLIST.unlink()
+        except OSError:
+            pass
+        print(f"autosave off (snapshots kept in {SNAP_DIR})")
+        return
+    # launchd starts jobs with a bare PATH: spell out where tmux and claude live.
     dirs = []
-    for d in [os.path.dirname(tmux_bin() or ""), os.path.dirname(shutil.which("claude") or ""),
-              "/usr/local/bin", "/opt/homebrew/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"]:
+    for d in [os.path.dirname(tmux_bin()), os.path.dirname(shutil.which("claude") or ""),
+              "/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"]:
         if d and d not in dirs:
             dirs.append(d)
     env = {"PATH": ":".join(dirs), "LC_ALL": "en_US.UTF-8"}
     for var in ("CCSNAP_HOME", "CLAUDE_CONFIG_DIR", "TMUX_TMPDIR"):
         if os.environ.get(var):
             env[var] = os.environ[var]
-    os.makedirs(STATE_DIR, exist_ok=True)
-    os.makedirs(os.path.dirname(LAUNCHD_PLIST), exist_ok=True)
-    plist = {
-        "Label": LAUNCHD_LABEL,
-        "ProgramArguments": [python, script, "save", "--auto"],
-        "StartInterval": minutes * 60,
-        "RunAtLoad": True,
-        "ProcessType": "Background",
-        "LowPriorityIO": True,
-        "Nice": 10,
-        "EnvironmentVariables": env,
-        "StandardOutPath": AUTO_LOG,
-        "StandardErrorPath": AUTO_LOG,
-    }
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    LAUNCHD_PLIST.parent.mkdir(parents=True, exist_ok=True)
     with open(LAUNCHD_PLIST, "wb") as fh:
-        plistlib.dump(plist, fh)
-    run(["launchctl", "bootout", "%s/%s" % (domain, LAUNCHD_LABEL)])
-    rc, _, err = run(["launchctl", "bootstrap", domain, LAUNCHD_PLIST])
-    if rc != 0:
-        time.sleep(1.0)  # bootout can still be settling
-        rc, _, err = run(["launchctl", "bootstrap", domain, LAUNCHD_PLIST])
-    if rc != 0:
-        die("launchctl could not load %s: %s" % (LAUNCHD_PLIST, err))
-    print("Automatic snapshots: on, every %d min (also after login)." % minutes)
-    print("A new snapshot is written only when something changed. Turn off with `ccsnap auto off`.")
-    return 0
+        plistlib.dump({
+            "Label": LAUNCHD_LABEL,
+            "ProgramArguments": [stable_python(), str(Path(__file__).resolve()), "save", "--quiet"],
+            "StartInterval": every * 60,
+            "RunAtLoad": True,
+            "ProcessType": "Background",
+            "LowPriorityIO": True,
+            "Nice": 10,
+            "EnvironmentVariables": env,
+            "StandardOutPath": str(AUTO_LOG),
+            "StandardErrorPath": str(AUTO_LOG),
+        }, fh)
+    quiet(["launchctl", "bootout", target])
+    r = quiet(["launchctl", "bootstrap", domain, str(LAUNCHD_PLIST)])
+    if r.returncode != 0:
+        time.sleep(1.0)  # the bootout above can still be settling
+        r = quiet(["launchctl", "bootstrap", domain, str(LAUNCHD_PLIST)])
+    if r.returncode != 0:
+        sys.exit(f"ccsnap: launchctl could not load {LAUNCHD_PLIST}: {r.stderr.strip()}")
+    print(f"autosave on: every {every} min, and at login → {SNAP_DIR}")
 
 
-# --------------------------------------------------------------------------- cli
+def cmd_auto(a):
+    every = max(1, a.every)
+    if MAC:
+        launchd_auto(a.action, every)
+    elif have_systemd_user():
+        systemd_auto(a.action, every)
+    else:
+        print("autosave needs systemd (Linux) or launchd (macOS), and this system has neither.\n"
+              "Add a cron entry instead (crontab -e):\n"
+              f"  */{every} * * * * {stable_python()} {Path(__file__).resolve()} save --quiet")
+        sys.exit(1)
 
-def main(argv=None):
+
+def main():
+    global TMUX_SOCKET
     for stream in (sys.stdout, sys.stderr):
         try:
             stream.reconfigure(encoding="utf-8", errors="replace")
         except (AttributeError, ValueError):
             pass
-    parser = argparse.ArgumentParser(
-        prog="ccsnap", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    sub = parser.add_subparsers(dest="cmd")
+    ap = argparse.ArgumentParser(prog="ccsnap", description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("-V", "--version", action="version", version=f"ccsnap {__version__}")
+    ap.add_argument("-L", dest="socket", metavar="NAME",
+                    help="use `tmux -L NAME` instead of the default server (also $CCSNAP_TMUX_SOCKET)")
+    sub = ap.add_subparsers(dest="cmd")
 
-    p = sub.add_parser("save", help="save a snapshot now")
-    p.add_argument("--auto", action="store_true", help=argparse.SUPPRESS)
-    p.set_defaults(func=cmd_save)
+    p = sub.add_parser("save", help="snapshot current tmux + Claude sessions")
+    p.add_argument("-q", "--quiet", action="store_true")
+    p.add_argument("--auto", action="store_true", help=argparse.SUPPRESS)  # what 0.1's launchd agent passes
+    p.add_argument("-f", "--force", action="store_true", help="save even if unchanged")
+    p.set_defaults(fn=cmd_save)
 
-    p = sub.add_parser("list", aliases=["ls"], help="list saved snapshots")
-    p.set_defaults(func=cmd_list)
+    p = sub.add_parser("list", aliases=["ls"], help="list snapshots")
+    p.add_argument("-n", type=int, default=20, help="how many to show (default 20)")
+    p.set_defaults(fn=cmd_list)
 
-    p = sub.add_parser("show", help="show what a snapshot holds")
-    p.add_argument("snapshot", nargs="?", help="snapshot id or prefix (default: latest)")
-    p.set_defaults(func=cmd_show)
+    for name, fn, hlp in (("show", cmd_show, "show what a snapshot contains"),
+                          ("restore", cmd_restore, "recreate tmux sessions and resume Claude")):
+        p = sub.add_parser(name, help=hlp)
+        p.add_argument("snapshot", nargs="?",
+                       help="number from `ccsnap list`, a snapshot name or its unique prefix, or a file path")
+        p.add_argument("--claude-bin", default="claude", help=argparse.SUPPRESS)
+        p.set_defaults(fn=fn)
+    p.add_argument("-o", "--only", nargs="+", metavar="SESSION", help="restore just these tmux sessions")
+    p.add_argument("-n", "--dry-run", action="store_true", help="print the plan, change nothing")
+    p.add_argument("--no-enter", action="store_true", help="type the claude commands but don't run them")
+    p.add_argument("-a", "--attach", action="store_true", help="attach to the first restored session")
+    p.add_argument("--force", action="store_true", help="start sessions even if they look already running")
+    p.add_argument("--replace", action="store_true",
+                   help="kill and rebuild tmux sessions that already exist (e.g. after a botched restore)")
+    p.add_argument("-y", "--yes", action="store_true", help="don't ask before --replace kills sessions")
+    p.add_argument("--wait", type=int, default=300, metavar="SEC",
+                   help="how long to wait for missing folders, e.g. a disk still mounting (default 300)")
+    p.add_argument("--stagger", type=float, default=0.4, help="seconds between launches (default 0.4)")
+    p.add_argument("--settle", type=float, default=1.0, help=argparse.SUPPRESS)
 
-    p = sub.add_parser("restore", help="rebuild tmux sessions and resume Claude in each pane",
-                       description="Rebuild the tmux sessions of a snapshot and resume Claude in each pane. "
-                                   "Without an id, uses the most recent snapshot that holds something not "
-                                   "currently running. Never touches tmux sessions that already exist.")
-    p.add_argument("snapshot", nargs="?", help="snapshot id or prefix (see `ccsnap list`)")
-    p.add_argument("-n", "--dry-run", action="store_true", help="show what would happen and stop")
-    p.add_argument("-y", "--yes", action="store_true", help="do not ask for confirmation")
-    p.add_argument("--only", action="append", metavar="NAME", help="restore only this tmux session (repeatable)")
-    p.add_argument("--loose", action="store_true",
-                   help="also reopen Claude sessions that ran outside tmux, in a tmux session named \"loose\"")
-    p.add_argument("--wait", type=float, default=45, metavar="SEC",
-                   help="longest to wait for each Claude to come up before starting the next (default 45)")
-    p.set_defaults(func=cmd_restore)
+    p = sub.add_parser("auto", help="turn autosave on or off, or show its status")
+    p.add_argument("action", nargs="?", choices=["on", "off", "status"], default="status")
+    p.add_argument("--every", type=int, default=2, metavar="MIN", help="minutes between snapshots (default 2)")
+    p.set_defaults(fn=cmd_auto)
+    # The names autosave had before `auto` existed.
+    p = sub.add_parser("install", help="same as `auto on`")
+    p.add_argument("--every", type=int, default=2, metavar="MIN", help="minutes between snapshots (default 2)")
+    p.set_defaults(fn=cmd_auto, action="on")
+    p = sub.add_parser("uninstall", help="same as `auto off`")
+    p.set_defaults(fn=cmd_auto, action="off", every=2)
 
-    p = sub.add_parser("auto", help="turn automatic snapshots on or off")
-    p.add_argument("action", choices=["on", "off", "status"], nargs="?", default="status")
-    p.add_argument("--every", type=int, default=5, metavar="MIN", help="minutes between snapshots (default 5)")
-    p.set_defaults(func=cmd_auto)
-
-    args = parser.parse_args(argv)
-    if not args.cmd:
-        args = parser.parse_args(["save"])
-    return args.func(args) or 0
+    a = ap.parse_args()
+    if not a.cmd:  # bare `ccsnap` saves
+        a = ap.parse_args(sys.argv[1:] + ["save"])
+    if a.socket:
+        TMUX_SOCKET = a.socket
+    try:
+        a.fn(a)
+    except RuntimeError as e:
+        sys.exit(f"ccsnap: {e}")
 
 
 if __name__ == "__main__":
     try:
-        sys.exit(main())
+        main()
     except KeyboardInterrupt:
         sys.exit(130)
